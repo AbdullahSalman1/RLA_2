@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import tempfile
+import uuid
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
+import streamlit.components.v1 as components
 import streamlit as st
 
-from routing import build_route, get_distance_matrix, geocode, min_to_time, simulate_route
+from geocache import geocode_all as geocode_all_cached
+from main import build_route, get_distance_matrix, min_to_time, simulate_route, time_to_min
 
 
 st.set_page_config(
@@ -282,95 +285,105 @@ def _prepare_route_locations(warehouse: dict[str, str], orders: pd.DataFrame):
     if orders.empty:
         raise ValueError("Please add at least one delivery before calculating routes.")
 
-    locations = []
-    warehouse_loc = geocode(warehouse["name"], warehouse["address"])
-    if warehouse_loc is None:
-        raise ValueError(f"Could not geocode warehouse address: {warehouse['address']}")
-    warehouse_loc.update(
-        {
-            "id": "W0",
-            "priority": None,
-            "time_window": ("00:00", "23:59"),
-            "boxes": 0,
-            "is_cold": False,
-            "is_suburban": False,
-            "source_type": "warehouse",
-        }
-    )
-    locations.append(warehouse_loc)
-
+    geocode_orders = []
     geocode_errors = []
     for row in orders.to_dict(orient="records"):
-        if not str(row.get("address", "") or "").strip():
+        address = str(row.get("address", "") or "").strip()
+        if not address:
             geocode_errors.append(f"{row.get('name', 'Unnamed order')} is missing an address.")
             continue
 
-        loc = geocode(str(row.get("name", "")), str(row.get("address", "")))
-        if loc is None:
-            geocode_errors.append(f"Could not geocode {row.get('name', 'an order')} ({row.get('address', '')}).")
-            continue
-
-        loc.update(
+        geocode_orders.append(
             {
                 "id": str(row.get("id", "")),
+                "name": str(row.get("name", "")),
+                "address": address,
                 "priority": str(row.get("priority", "normal")).lower(),
-                "time_window": _default_time_window(row),
-                "boxes": int(row.get("boxes", 0) or 0),
                 "is_cold": bool(row.get("is_cold", False)),
                 "is_suburban": bool(row.get("is_suburban", False)),
-                "source_type": "order",
+                "boxes": int(row.get("boxes", 0) or 0),
+                "time_window": _default_time_window(row),
             }
         )
-        locations.append(loc)
 
-    if len(locations) == 1:
+    locations = geocode_all_cached(geocode_orders, {"name": warehouse["name"], "address": warehouse["address"]})
+    if not locations or len(locations) == 1:
         raise ValueError("None of the delivery addresses could be geocoded.")
+
+    for loc in locations:
+        loc["source_type"] = "warehouse" if str(loc.get("id", "")) == "W0" else "order"
 
     return locations, geocode_errors
 
 
-def _assign_orders_to_vehicles(orders: pd.DataFrame, vehicles: pd.DataFrame):
+def _assign_orders_to_vehicles(orders, vehicles):
     sorted_orders = orders.copy()
     sorted_orders["priority_rank"] = sorted_orders["priority"].map(_priority_rank)
-    sorted_orders = sorted_orders.sort_values(["priority_rank", "boxes", "name"], ascending=[True, False, True])
+    sorted_orders = sorted_orders.sort_values(
+        ["priority_rank", "boxes", "name"], ascending=[True, False, True]
+    )
 
-    vehicle_rows = vehicles.to_dict(orient="records")
-    vehicle_rows = sorted(vehicle_rows, key=lambda row: (_vehicle_rank(row.get("type", "")), str(row.get("label", ""))))
-
-    vehicle_stops = {str(v["id"]): 0 for v in vehicle_rows}
+    vehicle_rows   = vehicles.to_dict(orient="records")
+    vehicle_stops  = {str(v["id"]): 0 for v in vehicle_rows}
     vehicle_orders = {str(v["id"]): [] for v in vehicle_rows}
     order_assignments = {}
 
     def pick_vehicle(preferred_types):
-        for vehicle in vehicle_rows:
-            vid = str(vehicle["id"])
-            if vehicle_stops[vid] < int(vehicle.get("max_stops", 0) or 0) and str(vehicle.get("type", "")).lower() in preferred_types:
-                return vehicle
-        for vehicle in vehicle_rows:
-            vid = str(vehicle["id"])
-            if vehicle_stops[vid] < int(vehicle.get("max_stops", 0) or 0):
-                return vehicle
+        # Iterate in PREFERENCE ORDER — first preferred type that has capacity wins
+        for preferred_type in preferred_types:
+            for vehicle in vehicle_rows:
+                vid       = str(vehicle["id"])
+                vtype     = str(vehicle.get("type", "")).lower()
+                max_stops = int(vehicle.get("max_stops", 0) or 0)
+                if vtype == preferred_type and vehicle_stops[vid] < max_stops:
+                    return vehicle
         return None
 
     for order in sorted_orders.to_dict(orient="records"):
-        preferred = ["small", "large", "refrigerated"]
-        if bool(order.get("is_cold", False)):
-            preferred = ["refrigerated", "large", "small"]
-        elif bool(order.get("is_suburban", False)):
-            preferred = ["large", "small", "refrigerated"]
+        is_cold     = bool(order.get("is_cold", False))
+        is_suburban = bool(order.get("is_suburban", False))
+
+        if is_cold:
+            # Hard constraint: cold chain MUST go to refrigerated van
+            preferred = ["refrigerated"]
+            fallback  = ["large", "small"]   # only if fridge is completely full
+        elif is_suburban:
+            # Suburban: large van preferred for range, small as fallback
+            preferred = ["large", "small"]
+            fallback  = []
+        else:
+            # City: small van preferred (agile), large as fallback only
+            # Refrigerated van NEVER assigned to non-cold orders
+            preferred = ["small"]
+            fallback  = ["large"]
 
         vehicle = pick_vehicle(preferred)
         if vehicle is None:
-            order_assignments[str(order.get("id", ""))] = {"vehicle_id": None, "reason": "All vehicles are full"}
+            vehicle = pick_vehicle(fallback)
+
+        if vehicle is None:
+            order_assignments[str(order.get("id", ""))] = {
+                "vehicle_id": None,
+                "reason": "All vehicles are full — unassigned"
+            }
             continue
 
         vid = str(vehicle["id"])
         vehicle_stops[vid] += 1
         vehicle_orders[vid].append(order)
+
+        # Describe why this vehicle was chosen
+        if is_cold:
+            reason = "cold chain → refrigerated van"
+        elif is_suburban:
+            reason = f"suburban → {vehicle.get('type', '')} van"
+        else:
+            reason = f"city → {vehicle.get('type', '')} van"
+
         order_assignments[str(order.get("id", ""))] = {
-            "vehicle_id": vid,
+            "vehicle_id":    vid,
             "vehicle_label": str(vehicle.get("label", vid)),
-            "reason": "Assigned by capacity and delivery type",
+            "reason":        reason,
         }
 
     return vehicle_orders, order_assignments
@@ -417,51 +430,271 @@ def _route_total_distance(route, distances):
     return float(total_km)
 
 
-def _route_map_figure(vehicle_label: str, route_results: list[dict], locations: list[dict]):
-    if not route_results:
-        return None
+def _build_route_without_optimization(stop_indices, locations):
+    critical = [i for i in stop_indices if locations[i]["priority"] == "critical"]
+    high = [i for i in stop_indices if locations[i]["priority"] == "high"]
+    normal = [i for i in stop_indices if locations[i]["priority"] == "normal"]
 
-    route_lats = [locations[0]["lat"]]
-    route_lons = [locations[0]["lon"]]
-    route_labels = [f"Warehouse: {locations[0]['name']}"]
-
-    for stop in route_results:
-        loc = locations[stop["location_index"]]
-        route_lats.append(loc["lat"])
-        route_lons.append(loc["lon"])
-        route_labels.append(
-            f"{stop['sequence']}. {stop['name']} | {stop['priority'].title()} | {stop['arrival']} → {stop['departure']}"
+    critical.sort(
+        key=lambda i: (
+            time_to_min(locations[i]["time_window"][0]),
+            time_to_min(locations[i]["time_window"][1]),
         )
-
-    route_lats.append(locations[0]["lat"])
-    route_lons.append(locations[0]["lon"])
-    route_labels.append(f"Return to {locations[0]['name']}")
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scattermapbox(
-            lat=route_lats,
-            lon=route_lons,
-            mode="lines+markers",
-            line=dict(width=4, color="#2563eb"),
-            marker=dict(size=10, color="#1d4ed8"),
-            hovertext=route_labels,
-            hoverinfo="text",
-            name=vehicle_label,
+    )
+    high.sort(
+        key=lambda i: (
+            time_to_min(locations[i]["time_window"][0]),
+            time_to_min(locations[i]["time_window"][1]),
         )
     )
 
-    fig.update_layout(
-        mapbox=dict(style="open-street-map", zoom=10),
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=520,
-        showlegend=False,
-        title=f"Route map — {vehicle_label}",
-    )
-    return fig
+    return critical + high + normal, len(critical) + len(high)
 
 
-def _build_route_report_html(route_plan: list[dict], warehouse: dict[str, str], geocode_warnings: list[str]):
+def _print_route_comparison(vehicle_label: str, driver_name: str, locations: list[dict], raw_route: list[int], raw_stops: list[dict], raw_total_km: float, raw_total_duration_min: float, optimized_route: list[int], optimized_stops: list[dict], optimized_total_km: float, optimized_total_duration_min: float):
+    raw_names = [locations[i]["name"] for i in raw_route]
+    opt_names = [locations[i]["name"] for i in optimized_route]
+    raw_late = sum(1 for stop in raw_stops if stop["is_late"])
+    opt_late = sum(1 for stop in optimized_stops if stop["is_late"])
+
+    print("\n" + "=" * 72)
+    print(f"  ROUTE COMPARISON — {vehicle_label}")
+    print(f"  Driver: {driver_name}")
+    print("-" * 72)
+    print(f"  WITHOUT optimization: {raw_names}")
+    print(f"    Distance: {raw_total_km:.1f} km | Duration: ~{int(raw_total_duration_min)} min | Late: {raw_late}")
+    print(f"  WITH optimization   : {opt_names}")
+    print(f"    Distance: {optimized_total_km:.1f} km | Duration: ~{int(optimized_total_duration_min)} min | Late: {opt_late}")
+    print("=" * 72)
+
+
+def _route_map_html(vehicle_label: str, route_results: list[dict], locations: list[dict]):
+        if not route_results:
+                return "<div class='route-map-empty'>No route stops available for this vehicle.</div>"
+
+        map_id = f"route_map_{uuid.uuid4().hex}"
+        warehouse = locations[0]
+        route_points = [
+                {
+                        "lat": warehouse["lat"],
+                        "lon": warehouse["lon"],
+                        "label": f"Warehouse: {warehouse['name']}",
+                        "kind": "warehouse",
+                        "sequence": "W",
+                }
+        ]
+
+        for stop in route_results:
+                loc = locations[stop["location_index"]]
+                route_points.append(
+                        {
+                                "lat": loc["lat"],
+                                "lon": loc["lon"],
+                                "label": f"{stop['sequence']}. {stop['name']} | {stop['priority'].title()} | {stop['arrival']} → {stop['departure']}",
+                                "kind": str(stop.get("priority", "normal")).lower(),
+                                "sequence": stop["sequence"],
+                        }
+                )
+
+        points_json = json.dumps(route_points, ensure_ascii=False)
+        vehicle_title = html.escape(vehicle_label)
+
+        return f"""
+        <div class='route-map-card'>
+            <div class='route-map-title'>{vehicle_title}</div>
+            <div id='{map_id}' class='route-map-canvas'></div>
+        </div>
+        <link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css' integrity='sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=' crossorigin='' />
+        <style>
+            .route-map-card {{ margin: 0.25rem 0 0.75rem 0; }}
+            .route-map-title {{ font-size: 1rem; font-weight: 700; margin: 0 0 0.5rem 0; color: #0f172a; }}
+            .route-map-canvas {{ height: 520px; width: 100%; border-radius: 14px; border: 1px solid #e2e8f0; overflow: hidden; }}
+            .route-map-empty {{ padding: 1rem; border: 1px dashed #cbd5e1; border-radius: 12px; color: #475569; background: #f8fafc; }}
+            .route-marker {{
+                width: 30px;
+                height: 30px;
+                line-height: 30px;
+                border-radius: 999px;
+                text-align: center;
+                color: white;
+                font-weight: 700;
+                font-size: 12px;
+                box-shadow: 0 4px 10px rgba(15, 23, 42, 0.25);
+                border: 2px solid white;
+            }}
+        </style>
+        <script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js' integrity='sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=' crossorigin=''></script>
+        <script>
+            (function() {{
+                const points = {points_json};
+                const map = L.map('{map_id}', {{ scrollWheelZoom: false }});
+                L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                    maxZoom: 19,
+                    attribution: '&copy; OpenStreetMap contributors'
+                }}).addTo(map);
+
+                const priorityColors = {{
+                    warehouse: '#1d4ed8',
+                    critical: '#dc2626',
+                    high: '#f59e0b',
+                    normal: '#2563eb'
+                }};
+
+                const coords = points.map((point) => [point.lat, point.lon]);
+
+                points.forEach((point) => {{
+                    const color = priorityColors[point.kind] || '#2563eb';
+                    const label = point.sequence;
+                    const icon = L.divIcon({{
+                        className: '',
+                        html: `<div class="route-marker" style="background:${{color}};">${{label}}</div>`,
+                        iconSize: [30, 30],
+                        iconAnchor: [15, 15],
+                        popupAnchor: [0, -14],
+                    }});
+
+                    L.marker([point.lat, point.lon], {{ icon }})
+                        .addTo(map)
+                        .bindPopup(`<strong>${{point.label}}</strong>`);
+                }});
+
+                if (coords.length > 1) {{
+                    L.polyline(coords, {{ color: '#2563eb', weight: 4, opacity: 0.85 }}).addTo(map);
+                    map.fitBounds(coords, {{ padding: [24, 24] }});
+                }} else if (coords.length === 1) {{
+                    map.setView(coords[0], 13);
+                }}
+
+                setTimeout(() => map.invalidateSize(), 250);
+            }})();
+        </script>
+        """
+
+
+def _all_deliveries_map_html(route_plan: list[dict], locations: list[dict]):
+        if not route_plan:
+                return "<div class='route-map-empty'>No deliveries available.</div>"
+
+        map_id = f"all_route_map_{uuid.uuid4().hex}"
+        warehouse = locations[0]
+
+        points = [
+                {
+                        "lat": warehouse["lat"],
+                        "lon": warehouse["lon"],
+                        "label": f"Warehouse: {warehouse['name']}",
+                        "kind": "warehouse",
+                        "sequence": "W",
+                        "vehicle": "Warehouse",
+                        "color": "#f59e0b",
+                }
+        ]
+
+        route_lines = []
+        palette = ["#2563eb", "#7c3aed", "#10b981", "#f97316", "#e11d48", "#0ea5e9", "#8b5cf6", "#14b8a6"]
+        global_seq = 1
+
+        for idx, entry in enumerate(route_plan):
+                vehicle = entry["vehicle"]
+                vehicle_label = str(vehicle.get("label", f"Vehicle {idx + 1}"))
+                color = palette[idx % len(palette)]
+
+                line_coords = [[warehouse["lat"], warehouse["lon"]]]
+                for stop in entry["stops"]:
+                        loc = locations[stop["location_index"]]
+                        line_coords.append([loc["lat"], loc["lon"]])
+                        points.append(
+                                {
+                                        "lat": loc["lat"],
+                                        "lon": loc["lon"],
+                                        "label": (
+                                                f"{global_seq}. {stop['name']}"
+                                                f" | Vehicle: {vehicle_label}"
+                                                f" | {stop['priority'].title()}"
+                                                f" | {stop['arrival']} → {stop['departure']}"
+                                        ),
+                                        "kind": str(stop.get("priority", "normal")).lower(),
+                                        "sequence": global_seq,
+                                        "vehicle": vehicle_label,
+                                        "color": color,
+                                }
+                        )
+                        global_seq += 1
+
+                line_coords.append([warehouse["lat"], warehouse["lon"]])
+                route_lines.append({"vehicle": vehicle_label, "color": color, "coords": line_coords})
+
+        points_json = json.dumps(points, ensure_ascii=False)
+        lines_json = json.dumps(route_lines, ensure_ascii=False)
+
+        return f"""
+        <div class='route-map-card'>
+            <div class='route-map-title'>All deliveries</div>
+            <div id='{map_id}' class='route-map-canvas'></div>
+        </div>
+        <link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css' integrity='sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=' crossorigin='' />
+        <style>
+            .route-map-card {{ margin: 0.25rem 0 0.75rem 0; }}
+            .route-map-title {{ font-size: 1rem; font-weight: 700; margin: 0 0 0.5rem 0; color: #0f172a; }}
+            .route-map-canvas {{ height: 620px; width: 100%; border-radius: 14px; border: 1px solid #e2e8f0; overflow: hidden; }}
+            .route-map-empty {{ padding: 1rem; border: 1px dashed #cbd5e1; border-radius: 12px; color: #475569; background: #f8fafc; }}
+            .route-marker {{
+                width: 30px;
+                height: 30px;
+                line-height: 30px;
+                border-radius: 999px;
+                text-align: center;
+                color: white;
+                font-weight: 700;
+                font-size: 12px;
+                box-shadow: 0 4px 10px rgba(15, 23, 42, 0.25);
+                border: 2px solid white;
+            }}
+        </style>
+        <script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js' integrity='sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=' crossorigin=''></script>
+        <script>
+            (function() {{
+                const points = {points_json};
+                const lines = {lines_json};
+                const map = L.map('{map_id}', {{ scrollWheelZoom: false }});
+                L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                    maxZoom: 19,
+                    attribution: '&copy; OpenStreetMap contributors'
+                }}).addTo(map);
+
+                points.forEach((point) => {{
+                    const icon = L.divIcon({{
+                        className: '',
+                        html: `<div class="route-marker" style="background:${{point.color}};">${{point.sequence}}</div>`,
+                        iconSize: [30, 30],
+                        iconAnchor: [15, 15],
+                        popupAnchor: [0, -14],
+                    }});
+
+                    L.marker([point.lat, point.lon], {{ icon }})
+                        .addTo(map)
+                        .bindPopup(`<strong>${{point.label}}</strong>`);
+                }});
+
+                const bounds = [];
+                lines.forEach((line) => {{
+                    L.polyline(line.coords, {{ color: line.color, weight: 4, opacity: 0.85 }}).addTo(map);
+                    line.coords.forEach((coord) => bounds.push(coord));
+                }});
+
+                if (bounds.length > 0) {{
+                    map.fitBounds(bounds, {{ padding: [28, 28] }});
+                }} else {{
+                    map.setView([points[0].lat, points[0].lon], 12);
+                }}
+
+                setTimeout(() => map.invalidateSize(), 250);
+            }})();
+        </script>
+        """
+
+
+def _build_route_report_html(route_plan: list[dict], warehouse: dict[str, str], geocode_warnings: list[str], all_map_html: str):
     sections = []
     total_stops = sum(len(entry["stops"]) for entry in route_plan)
     total_km = sum(entry["total_km"] for entry in route_plan)
@@ -540,12 +773,14 @@ def _build_route_report_html(route_plan: list[dict], warehouse: dict[str, str], 
         <div>Late deliveries<strong>{total_late}</strong></div>
         <div>Vehicles used<strong>{len(route_plan)}</strong></div>
       </div>
+            {all_map_html}
       {''.join(sections)}
     </body>
     </html>
     """
 
 
+@st.cache_data(show_spinner=False)
 def calculate_routes_for_dashboard(warehouse: dict[str, str], orders: pd.DataFrame, vehicles: pd.DataFrame, drivers: pd.DataFrame):
     locations, geocode_warnings = _prepare_route_locations(warehouse, orders)
     distances, durations = get_distance_matrix(locations)
@@ -567,11 +802,35 @@ def calculate_routes_for_dashboard(warehouse: dict[str, str], orders: pd.DataFra
         if not stop_indices:
             continue
 
-        final_route, locked_count = build_route(stop_indices, locations, distances)
+        raw_route, raw_locked_count = _build_route_without_optimization(stop_indices, locations)
         driver = vehicle_drivers.get(vid)
         sim_driver = driver or {"name": "No driver assigned", "shift_start": "07:00", "max_hours": 8}
+        final_route, locked_count = build_route(stop_indices, locations, distances, sim_driver, durations)
+        raw_stops, raw_total_duration_min = simulate_route(raw_route, locations, durations, sim_driver)
         sim_stops, total_duration_min = simulate_route(final_route, locations, durations, sim_driver)
+        raw_total_km = _route_total_distance(raw_route, distances)
         route_total_km = _route_total_distance(final_route, distances)
+
+        print(
+            f"\n  {vehicle.get('label', vid)} ({driver.get('name') if driver else 'No driver'}) — {len(stop_indices)} stops"
+        )
+        print(f"    Raw order (no optimization): {[locations[i]['name'] for i in raw_route]}")
+        print(f"    Locked (priority): {[locations[i]['name'] for i in final_route[:locked_count]]}")
+        print(f"    Final route       : {[locations[i]['name'] for i in final_route[locked_count:]]}")
+        print(f"    Final order: {[locations[i]['name'] for i in final_route]}")
+        _print_route_comparison(
+            str(vehicle.get("label", vid)),
+            driver["name"] if driver else "No driver",
+            locations,
+            raw_route,
+            raw_stops,
+            raw_total_km,
+            raw_total_duration_min,
+            final_route,
+            sim_stops,
+            route_total_km,
+            total_duration_min,
+        )
 
         route_stops = []
         for seq, stop in enumerate(sim_stops, start=1):
@@ -589,8 +848,7 @@ def calculate_routes_for_dashboard(warehouse: dict[str, str], orders: pd.DataFra
                 }
             )
 
-        map_fig = _route_map_figure(str(vehicle.get("label", vid)), route_stops, locations)
-        map_html = map_fig.to_html(include_plotlyjs="cdn", full_html=False) if map_fig is not None else ""
+        map_html = _route_map_html(str(vehicle.get("label", vid)), route_stops, locations)
 
         route_plan.append(
             {
@@ -600,17 +858,18 @@ def calculate_routes_for_dashboard(warehouse: dict[str, str], orders: pd.DataFra
                 "total_km": route_total_km,
                 "total_duration_min": total_duration_min,
                 "locked_count": locked_count,
-                "map_fig": map_fig,
                 "map_html": map_html,
             }
         )
 
-    report_html = _build_route_report_html(route_plan, warehouse, geocode_warnings)
+    all_map_html = _all_deliveries_map_html(route_plan, locations)
+    report_html = _build_route_report_html(route_plan, warehouse, geocode_warnings, all_map_html)
     return {
         "route_plan": route_plan,
         "order_assignments": order_assignments,
         "geocode_warnings": geocode_warnings,
         "report_html": report_html,
+        "all_map_html": all_map_html,
         "locations": locations,
     }
 
@@ -927,6 +1186,8 @@ if route_result:
     if not route_plan:
         st.info("No vehicle routes were generated from the current data.")
     else:
+        st.caption("All deliveries map")
+        components.html(route_result["all_map_html"], height=660, scrolling=False)
         tabs = st.tabs([entry["vehicle"]["label"] for entry in route_plan])
         for tab, entry in zip(tabs, route_plan):
             with tab:
@@ -938,10 +1199,7 @@ if route_result:
                 route_cols[2].metric("Duration (min)", int(entry["total_duration_min"]))
                 route_cols[3].metric("Driver", driver_name)
 
-                if entry["map_fig"] is not None:
-                    st.plotly_chart(entry["map_fig"], use_container_width=True)
-                else:
-                    st.info("No map available for this vehicle.")
+                components.html(entry["map_html"], height=560, scrolling=False)
 
                 stop_rows = []
                 for stop in entry["stops"]:
