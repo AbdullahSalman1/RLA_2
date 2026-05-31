@@ -37,6 +37,7 @@ DATA_FILE = Path(__file__).with_name("delivery_data.xlsx")
 FLEET_FILE = Path(__file__).with_name("fleet_data.xlsx")
 
 
+
 def _as_bool(value):
     if isinstance(value, bool):
         return value
