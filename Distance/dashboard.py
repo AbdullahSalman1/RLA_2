@@ -5,6 +5,7 @@ import json
 import re
 import tempfile
 import uuid
+from datetime import time as dt_time
 from pathlib import Path
 
 import pandas as pd
@@ -12,8 +13,8 @@ import plotly.express as px
 import streamlit.components.v1 as components
 import streamlit as st
 
-from geocache import geocode_all as geocode_all_cached
-from main import build_route, get_distance_matrix, min_to_time, simulate_route, time_to_min
+from geocache import geocode_all as geocode_all_cached, geocode_single as geocode_single_cached
+from main import SERVICE_TIME_MIN, build_route, get_distance_matrix, min_to_time, simulate_route, time_to_min
 
 
 st.set_page_config(
@@ -277,6 +278,170 @@ def _default_time_window(order_row: dict) -> tuple[str, str]:
     if start and end:
         return start, end
     return "07:00", "18:00"
+
+
+def _format_time_value(value) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M")
+    text = str(value).strip()
+    match = re.search(r"\d{1,2}:\d{2}", text)
+    return match.group(0) if match else text
+
+
+def _time_value_to_min(value) -> int:
+    text = _format_time_value(value)
+    match = re.search(r"\d{1,2}:\d{2}", text)
+    if not match:
+        raise ValueError("Please enter a valid emergency time.")
+    return time_to_min(match.group(0))
+
+
+def _geocode_emergency_location(emergency_address: str) -> dict:
+    emergency_address = emergency_address.strip()
+    if not emergency_address:
+        raise ValueError("Please enter an emergency address.")
+
+    emergency_location = geocode_single_cached("Emergency delivery", emergency_address)
+    if not emergency_location:
+        raise ValueError("The emergency address could not be geocoded. Please make it more specific.")
+    emergency_location["id"] = "E0"
+    emergency_location["priority"] = "critical"
+    emergency_location["time_window"] = ("", "")
+    emergency_location["boxes"] = 1
+    emergency_location["is_cold"] = False
+    emergency_location["is_suburban"] = False
+    return emergency_location
+
+
+def _evaluate_emergency_delivery(warehouse: dict[str, str], emergency_address: str, emergency_time, route_result: dict | None):
+    if not warehouse.get("name") or not warehouse.get("address"):
+        raise ValueError("Please enter a warehouse name and address before processing an emergency delivery.")
+
+    emergency_time_str = _format_time_value(emergency_time)
+    if not emergency_time_str:
+        raise ValueError("Please choose a valid emergency time.")
+
+    emergency_target_min = _time_value_to_min(emergency_time_str)
+    emergency_location = _geocode_emergency_location(emergency_address)
+    warehouse_location = geocode_single_cached(warehouse["name"], warehouse["address"])
+    if not warehouse_location:
+        raise ValueError("The warehouse address could not be geocoded, so emergency routing cannot continue.")
+
+    base_locations = [warehouse_location]
+    route_plan = []
+    if route_result and route_result.get("locations"):
+        base_locations = route_result["locations"]
+        route_plan = route_result.get("route_plan", [])
+
+    temp_locations = base_locations + [emergency_location]
+    distances, durations = get_distance_matrix(temp_locations)
+    if distances is None or durations is None:
+        raise ValueError("The emergency distance matrix request failed. Please check your internet connection or API settings.")
+
+    emergency_idx = len(temp_locations) - 1
+    emergency_rows = []
+
+    if route_plan:
+        candidates = [entry for entry in route_plan if entry.get("driver")]
+    else:
+        candidates = [
+            {
+                "vehicle": None,
+                "driver": driver_row,
+                "stops": [],
+                "total_duration_min": 0,
+                "total_km": 0.0,
+            }
+            for driver_row in drivers_df.to_dict(orient="records")
+        ]
+
+    for candidate in candidates:
+        driver = candidate.get("driver") or {}
+        driver_name = str(driver.get("name", "Unknown driver"))
+        shift_start = str(driver.get("shift_start", "07:00") or "07:00")
+        max_hours = int(driver.get("max_hours", 0) or 0)
+        shift_start_min = time_to_min(_format_time_value(shift_start) or "07:00")
+        shift_end_min = shift_start_min + max_hours * 60
+
+        route_points = [{"location_index": 0, "name": "Warehouse", "available_min": shift_start_min}]
+        for stop in candidate.get("stops", []):
+            route_points.append(
+                {
+                    "location_index": int(stop["location_index"]),
+                    "name": str(stop.get("name", "Stop")),
+                    "available_min": time_to_min(str(stop.get("departure", "00:00") or "00:00")),
+                }
+            )
+
+        best_point = None
+        for point in route_points:
+            loc_idx = int(point["location_index"])
+            travel_min = float(durations[loc_idx][emergency_idx])
+            travel_km = float(distances[loc_idx][emergency_idx])
+            arrival_min = int(point["available_min"] + travel_min)
+            finish_min = arrival_min + SERVICE_TIME_MIN
+            candidate_point = {
+                "point_name": point["name"],
+                "geo_distance_km": travel_km,
+                "travel_min": travel_min,
+                "arrival_min": arrival_min,
+                "finish_min": finish_min,
+            }
+            if best_point is None:
+                best_point = candidate_point
+                continue
+
+            current_key = (candidate_point["geo_distance_km"], candidate_point["arrival_min"])
+            best_key = (best_point["geo_distance_km"], best_point["arrival_min"])
+            if current_key < best_key:
+                best_point = candidate_point
+
+        assert best_point is not None
+        time_margin_after_delivery = shift_end_min - best_point["finish_min"]
+        is_feasible = best_point["arrival_min"] <= emergency_target_min and time_margin_after_delivery >= 0
+        route_distance_km = float(candidate.get("total_km", 0.0) or 0.0)
+        average_speed = route_distance_km / max((int(candidate.get("total_duration_min", 0) or 0) / 60.0), 1e-6) if route_distance_km > 0 else 30.0
+        estimated_speed = max(average_speed, 20.0)
+        estimated_extra_minutes = max(best_point["travel_min"], best_point["geo_distance_km"] / estimated_speed * 60.0)
+        emergency_rows.append(
+            {
+                "Driver": driver_name,
+                "Vehicle": str(candidate.get("vehicle", {}).get("label", "No assigned vehicle")) if candidate.get("vehicle") else "No assigned vehicle",
+                "Closest point": best_point["point_name"],
+                "Geo distance (km)": round(best_point["geo_distance_km"], 2),
+                "Travel to emergency (min)": int(round(best_point["travel_min"])),
+                "Estimated arrival": min_to_time(best_point["arrival_min"]),
+                "Requested by": emergency_time_str,
+                "Shift ends": min_to_time(shift_end_min),
+                "Time margin after delivery (min)": int(time_margin_after_delivery),
+                "Estimated extra time (min)": int(round(estimated_extra_minutes + SERVICE_TIME_MIN)),
+                "Suitable": "Yes" if is_feasible else "No",
+                "Score": (
+                    0 if is_feasible else 1,
+                    round(best_point["geo_distance_km"], 3),
+                    max(0, best_point["arrival_min"] - emergency_target_min),
+                    -time_margin_after_delivery,
+                ),
+            }
+        )
+
+    if not emergency_rows:
+        raise ValueError("No drivers are available to evaluate for emergency delivery.")
+
+    emergency_rows = sorted(emergency_rows, key=lambda row: row["Score"])
+    recommendation = emergency_rows[0]
+    feasible_rows = [row for row in emergency_rows if row["Suitable"] == "Yes"]
+
+    return {
+        "emergency_address": emergency_address.strip(),
+        "emergency_time": emergency_time_str,
+        "emergency_location": emergency_location,
+        "recommended": recommendation if feasible_rows else None,
+        "best_available": recommendation,
+        "all_candidates": emergency_rows,
+    }
 
 
 def _prepare_route_locations(warehouse: dict[str, str], orders: pd.DataFrame):
@@ -890,6 +1055,10 @@ if "route_report_path" not in st.session_state:
     st.session_state.route_report_path = None
 if "route_error" not in st.session_state:
     st.session_state.route_error = ""
+if "emergency_result" not in st.session_state:
+    st.session_state.emergency_result = None
+if "emergency_error" not in st.session_state:
+    st.session_state.emergency_error = ""
 
 
 st.sidebar.header("Data sources")
@@ -916,6 +1085,8 @@ if reset_clicked:
     st.session_state.route_result = None
     st.session_state.route_report_path = None
     st.session_state.route_error = ""
+    st.session_state.emergency_result = None
+    st.session_state.emergency_error = ""
     st.sidebar.success("Tables reset. Add or upload new data anytime.")
 
 if load_clicked:
@@ -929,6 +1100,8 @@ if load_clicked:
     st.session_state.route_result = None
     st.session_state.route_report_path = None
     st.session_state.route_error = ""
+    st.session_state.emergency_result = None
+    st.session_state.emergency_error = ""
     st.sidebar.success("Files loaded into editable tables.")
 
 st.sidebar.header("Warehouse")
@@ -1126,6 +1299,8 @@ if clear_results_clicked:
     st.session_state.route_result = None
     st.session_state.route_report_path = None
     st.session_state.route_error = ""
+    st.session_state.emergency_result = None
+    st.session_state.emergency_error = ""
     st.success("Route results cleared.")
 
 if calculate_clicked:
@@ -1137,6 +1312,8 @@ if calculate_clicked:
             st.session_state.route_result = result
             st.session_state.route_report_path = report_path
             st.session_state.route_error = ""
+            st.session_state.emergency_result = None
+            st.session_state.emergency_error = ""
         st.success("Routes calculated successfully.")
     except Exception as exc:
         st.session_state.route_result = None
@@ -1216,6 +1393,57 @@ if route_result:
                         }
                     )
                 st.dataframe(pd.DataFrame(stop_rows), hide_index=True, use_container_width=True)
+
+st.subheader("Emergency delivery")
+emergency_col1, emergency_col2 = st.columns([1.25, 0.75])
+with emergency_col1:
+    emergency_address = st.text_input(
+        "Emergency address",
+        key="emergency_address_input",
+        placeholder="Enter the urgent delivery address",
+    )
+with emergency_col2:
+    emergency_time = st.time_input(
+        "Needed by",
+        key="emergency_time_input",
+        value=dt_time(10, 0),
+    )
+
+emergency_process_clicked = st.button("Process emergency delivery", type="secondary", use_container_width=True)
+
+if emergency_process_clicked:
+    try:
+        st.session_state.emergency_result = _evaluate_emergency_delivery(warehouse, emergency_address, emergency_time, route_result)
+        st.session_state.emergency_error = ""
+        st.success("Emergency delivery evaluated successfully.")
+    except Exception as exc:
+        st.session_state.emergency_result = None
+        st.session_state.emergency_error = str(exc)
+        st.error(f"Emergency delivery failed: {exc}")
+
+if st.session_state.emergency_error:
+    st.warning(st.session_state.emergency_error)
+
+if st.session_state.emergency_result:
+    emergency_result = st.session_state.emergency_result
+    recommended = emergency_result.get("recommended")
+    if recommended:
+        st.success(
+            f"Recommended driver: {recommended['Driver']} · Vehicle: {recommended['Vehicle']} · Closest point: {recommended['Closest point']}"
+        )
+        recap_cols = st.columns(4)
+        recap_cols[0].metric("Geo distance (km)", f"{recommended['Geo distance (km)']:.2f}")
+        recap_cols[1].metric("Travel time (min)", recommended["Travel to emergency (min)"])
+        recap_cols[2].metric("Arrival", recommended["Estimated arrival"])
+        recap_cols[3].metric("Margin after delivery (min)", recommended["Time margin after delivery (min)"])
+    else:
+        st.warning(
+            f"No driver fully meets the requested time and shift margin. Closest option: {emergency_result['best_available']['Driver']}"
+        )
+
+    st.caption("Ranked emergency-driver candidates")
+    emergency_table = pd.DataFrame(emergency_result["all_candidates"]).drop(columns=["Score"])
+    st.dataframe(emergency_table, hide_index=True, use_container_width=True)
 
 st.caption(
     "Tip: upload a different workbook whenever you want to replace the current data, then click \"Load selected files\". The tables remain editable after that."

@@ -173,6 +173,19 @@ def geocode_all(orders: list, warehouse: dict) -> list:
     return locations
 
 
+def geocode_single(name: str, address: str) -> dict:
+    """
+    Geocode one address using the same cache-backed flow as geocode_all().
+
+    Returns a location dict with lat/lon when successful, or None if geocoding fails.
+    """
+    cache = load_cache()
+    result = geocode(name, address, cache)
+    if result:
+        save_cache(cache)
+    return result
+
+
 # ── Test ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

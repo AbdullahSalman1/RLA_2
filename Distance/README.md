@@ -33,6 +33,7 @@ The dashboard turns those constraints into a usable delivery plan with a clear m
 	- each vehicle route separately
 - Print route comparisons in the terminal for debugging and validation
 - Generate a full HTML route report in a new tab
+- Evaluate emergency deliveries by ranking the best driver for a requested address and time
 
 ## How the dashboard works
 
@@ -48,6 +49,7 @@ The dashboard turns those constraints into a usable delivery plan with a clear m
 	 - builds the final route for each vehicle
 	 - simulates the schedule stop by stop
 	 - renders the route maps and report
+	 - can also score an emergency delivery against the current fleet and route plan
 
 ## Routing solution
 
