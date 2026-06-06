@@ -153,7 +153,10 @@ The schedule checker uses the matrix durations and service times to detect:
 - `dashboard.py` — Streamlit user interface, maps, tables, report generation, and route display
 - `main.py` — Core data loading, geocoding, assignment, routing, simulation, and terminal printing
 - `geocache.py` — Cached geocoding support
-- `routing.py` — Legacy routing module kept for reference only; it is not the active dashboard route source
+- `generate_docx.py` — Utilities to generate DOCX reports from route results
+- `delivery_data.xlsx` — Example/sample delivery workbook (if present)
+- `fleet_data.xlsx` — Example/sample fleet workbook (if present)
+- `geocache.xlsx` — Persisted geocoding cache used for development/testing
 - `README.md` — Project documentation
 - `requirements.txt` — Python dependencies
 
